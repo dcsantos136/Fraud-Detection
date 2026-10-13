@@ -7,3 +7,4 @@ feast
 pyarrow
 mlflow
 optuna
+bentoml

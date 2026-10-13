@@ -141,3 +141,18 @@ with mlflow.start_run():
     mlflow.log_artifact("fraud_model.pkl")
     print(f"Logged best params and validation AUC ({final_auc}) to MLflow")
 
+# If BentoML is available, save the model into BentoML model store for serving
+try:
+    import bentoml
+    from bentoml._internal.models import Model
+
+    try:
+        # Save sklearn model under the name 'fraud_model'
+        bentoml.sklearn.save_model("fraud_model", final_model)
+        print("Registered model with BentoML as 'fraud_model'.")
+    except Exception as e:
+        print("BentoML model registration failed:", e)
+except Exception:
+    # BentoML not installed; skip registration
+    pass
+
