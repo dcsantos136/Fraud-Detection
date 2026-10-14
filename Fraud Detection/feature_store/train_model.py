@@ -1,27 +1,30 @@
-# Train a fraud detection model using Optuna hyperparameter tuning
-# and save the best model for later inference.
+# Train two fraud detection models for a simple A/B test setup.
+# model_a is the champion/random forest model and model_b is the challenger/logistic model.
+
+import os
+from pathlib import Path
 
 import joblib
+import mlflow
 import optuna
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
-import os
-from pathlib import Path
-import mlflow
 
+FEATURE_STORE_DIR = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 print("\n-----------------------------------------------------")
 print("Loading features from feature store")
 print("-----------------------------------------------------\n")
 
-# Read feature dataset from feature store
-# Replace the path if your dataset location differs
 try:
-    df = pd.read_parquet("feature_repo/fraud_transactions.parquet")
+    df = pd.read_parquet(FEATURE_STORE_DIR / "feature_repo" / "fraud_transactions.parquet")
 except FileNotFoundError:
-    df = pd.read_csv("..\\feature pipeline\\data\\fraud_data.csv")
+    data_path = REPO_ROOT / "Fraud Detection" / "feature pipeline" / "data" / "fraud_data.csv"
+    df = pd.read_csv(data_path)
 
 print(df.head())
 
@@ -54,7 +57,6 @@ try:
         stratify=y,
     )
 except ValueError:
-    # Fallback when stratified split isn't possible (e.g., very small classes)
     X_train, X_valid, y_train, y_valid = train_test_split(
         X,
         y,
@@ -75,23 +77,20 @@ def objective(trial):
         "class_weight": trial.suggest_categorical("class_weight", [None, "balanced"]),
         "random_state": 42,
     }
-
     model = RandomForestClassifier(**params)
     model.fit(X_train, y_train)
-
     proba = model.predict_proba(X_valid)[:, 1]
-    score = roc_auc_score(y_valid, proba)
-    return score
+    return roc_auc_score(y_valid, proba)
 
 
 print("\n-----------------------------------------------------")
-print("Running Optuna Hyperparameter Tuning")
+print("Running Optuna Hyperparameter Tuning for model_a")
 print("-----------------------------------------------------\n")
-# Guard: small or imbalanced datasets can make stratified tuning and ROC AUC unstable.
+
 class_counts = y.value_counts()
 if len(y) < 20 or class_counts.min() < 2:
     print("Dataset too small or imbalanced for hyperparameter search; using defaults.")
-    best_params = {
+    model_a_params = {
         "n_estimators": 100,
         "max_depth": 7,
         "min_samples_split": 2,
@@ -101,58 +100,63 @@ if len(y) < 20 or class_counts.min() < 2:
         "class_weight": None,
     }
 else:
-    study = optuna.create_study(direction="maximize", study_name="fraud_detection_rf")
-    study.optimize(objective, n_trials=30)
-    best_params = study.best_params
-    print("Best trial score:", study.best_value)
-    print("Best parameters:", best_params)
+    study = optuna.create_study(direction="maximize", study_name="fraud_detection_model_a")
+    study.optimize(objective, n_trials=20)
+    model_a_params = study.best_params
+    print("Best model_a trial score:", study.best_value)
+    print("Best model_a parameters:", model_a_params)
 
-print("\n-----------------------------------------------------")
-print("Training final model with best parameters")
-print("-----------------------------------------------------\n")
+model_a = RandomForestClassifier(**model_a_params, random_state=42)
+model_a.fit(X_train, y_train)
 
-final_model = RandomForestClassifier(**best_params, random_state=42)
-final_model.fit(X_train, y_train)
+model_b = LogisticRegression(
+    max_iter=2000,
+    class_weight="balanced",
+    random_state=42,
+)
+model_b.fit(X_train, y_train)
 
-# Save the model for later use in inference
-joblib.dump(final_model, "fraud_model.pkl")
-print("Model saved successfully.")
-print("File: fraud_model.pkl")
+joblib.dump(model_a, FEATURE_STORE_DIR / "model_a.pkl")
+joblib.dump(model_b, FEATURE_STORE_DIR / "model_b.pkl")
+joblib.dump(model_a, FEATURE_STORE_DIR / "fraud_model.pkl")
 
-# MLflow tracking: use central server if MLFLOW_TRACKING_URI is set; otherwise local ./mlruns
+print("Models saved successfully.")
+print("Files: model_a.pkl, model_b.pkl, fraud_model.pkl")
+
 tracking_uri = os.environ.get("MLFLOW_TRACKING_URI")
 if tracking_uri:
     mlflow.set_tracking_uri(tracking_uri)
 else:
-    # Use local mlruns directory in repo root
-    repo_root = Path(__file__).resolve().parents[2]
-    mlflow.set_tracking_uri(f"file://{repo_root / 'mlruns'}")
+    mlflow.set_tracking_uri(f"file://{REPO_ROOT / 'mlruns'}")
 
-mlflow.set_experiment("fraud_detection")
-with mlflow.start_run():
-    # Log best params
-    for k, v in best_params.items():
-        mlflow.log_param(k, v)
-    # Evaluate on validation set and log metric
-    valid_proba = final_model.predict_proba(X_valid)[:, 1]
-    final_auc = roc_auc_score(y_valid, valid_proba)
-    mlflow.log_metric("validation_roc_auc", float(final_auc))
-    # Log model artifact
-    mlflow.log_artifact("fraud_model.pkl")
-    print(f"Logged best params and validation AUC ({final_auc}) to MLflow")
+mlflow.set_experiment("fraud_detection_ab")
 
-# If BentoML is available, save the model into BentoML model store for serving
+for model_name, model, params in [
+    ("model_a", model_a, model_a_params),
+    ("model_b", model_b, {"C": 1.0, "max_iter": 2000, "class_weight": "balanced"}),
+]:
+    with mlflow.start_run(run_name=f"{model_name}_ab_test"):
+        for key, value in params.items():
+            mlflow.log_param(key, value)
+
+        if hasattr(model, "predict_proba"):
+            valid_proba = model.predict_proba(X_valid)[:, 1]
+        else:
+            valid_proba = model.decision_function(X_valid)
+        valid_auc = roc_auc_score(y_valid, valid_proba)
+        mlflow.log_metric("validation_roc_auc", float(valid_auc))
+        mlflow.log_artifact(str(FEATURE_STORE_DIR / f"{model_name}.pkl"))
+        print(f"Logged {model_name} validation AUC ({valid_auc}) to MLflow")
+
 try:
     import bentoml
-    from bentoml._internal.models import Model
 
     try:
-        # Save sklearn model under the name 'fraud_model'
-        bentoml.sklearn.save_model("fraud_model", final_model)
-        print("Registered model with BentoML as 'fraud_model'.")
+        bentoml.sklearn.save_model("fraud_model", model_a)
+        bentoml.sklearn.save_model("fraud_model_challenger", model_b)
+        print("Registered model_a and model_b with BentoML.")
     except Exception as e:
         print("BentoML model registration failed:", e)
 except Exception:
-    # BentoML not installed; skip registration
     pass
 
